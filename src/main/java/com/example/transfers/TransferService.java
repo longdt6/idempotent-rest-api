@@ -1,24 +1,38 @@
 package com.example.transfers;
 
-import java.util.List;
-import java.util.Optional;
-import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+
 @Service
 public class TransferService {
-    private static final long MAX_BALANCE_CENTS = 1000000000000L;
     private final AccountRepository accounts;
     private final TransferRepository transfers;
+    private final TransferClaimService claims;
+    private final TransferProcessor processor;
+    private final long processingDelayMs;
 
-    public TransferService(AccountRepository accounts, TransferRepository transfers) {
+    public TransferService(AccountRepository accounts, TransferRepository transfers,
+                           TransferClaimService claims, TransferProcessor processor,
+                           @Value("${demo.processing-delay-ms:0}") long processingDelayMs) {
         this.accounts = accounts;
         this.transfers = transfers;
+        this.claims = claims;
+        this.processor = processor;
+        this.processingDelayMs = processingDelayMs;
     }
 
-    public record Outcome(int status, TransferResult body, boolean replayed) {}
-    public record AccountBalance(Long id, long balanceCents) {}
+    public record Outcome(int status, TransferResult body, boolean replayed) {
+    }
+
+    public record AccountBalance(Long id, long balanceCents) {
+    }
 
     @Transactional(readOnly = true)
     public List<AccountBalance> listAccounts() {
@@ -31,42 +45,39 @@ public class TransferService {
         return transfers.findByTransferId(id).map(TransferRecord::toResult);
     }
 
-    @Transactional
     public Outcome transfer(UUID key, TransferRequest request) {
-        // This learning demo assumes requests execute sequentially.
-        var existing = transfers.findById(key.toString());
-        if (existing.isPresent()) {
-            var stored = existing.get();
-            if (!stored.matches(request)) {
-                return new Outcome(409, new TransferResult(null, request.fromAccountId(),
-                        request.toAccountId(), request.amountCents(), "idempotency_key_reused"), false);
+        UUID token = UUID.randomUUID();
+        try {
+            claims.insert(key, request, token);
+        } catch (DataIntegrityViolationException duplicate) {
+            // The failed INSERT transaction has rolled back before inspecting the existing key.
+            try {
+                var response = claims.resolve(key, request, token);
+                if (response != null) return response;
+            } catch (ObjectOptimisticLockingFailureException takeoverLost) {
+                return processing(request);
             }
-            return new Outcome(stored.getHttpStatus(), stored.toResult(), true);
         }
-        if (request.fromAccountId().equals(request.toAccountId())) {
-            return finish(key, request, 422, null, "same_account");
+        try {
+            // Optional demo delay occurs before the transaction that moves money.
+            if (processingDelayMs > 0) Thread.sleep(processingDelayMs);
+            return processor.process(key, request, token);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            claims.release(key, token);
+            throw new IllegalStateException("Transfer interrupted", interrupted);
+        } catch (RuntimeException failure) {
+            try {
+                claims.release(key, token);
+            } catch (RuntimeException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
         }
-        var sourceAccount = accounts.findById(request.fromAccountId());
-        var destinationAccount = accounts.findById(request.toAccountId());
-        if (sourceAccount.isEmpty() || destinationAccount.isEmpty()) {
-            return finish(key, request, 404, null, "account_not_found");
-        }
-        var source = sourceAccount.get();
-        var destination = destinationAccount.get();
-        if (source.getBalanceCents() < request.amountCents()) {
-            return finish(key, request, 422, null, "insufficient_funds");
-        }
-        if (destination.getBalanceCents() > MAX_BALANCE_CENTS - request.amountCents()) {
-            return finish(key, request, 422, null, "destination_balance_limit");
-        }
-        // Hibernate dirty checking persists both managed accounts at transaction commit.
-        source.debit(request.amountCents());
-        destination.credit(request.amountCents());
-        return finish(key, request, 201, UUID.randomUUID(), null);
     }
 
-    private Outcome finish(UUID key, TransferRequest request, int status, UUID id, String error) {
-        var stored = transfers.save(new TransferRecord(key, request, status, id, error));
-        return new Outcome(status, stored.toResult(), false);
+    static Outcome processing(TransferRequest request) {
+        return new Outcome(409, new TransferResult(null, request.fromAccountId(),
+                request.toAccountId(), request.amountCents(), "request_processing"), false);
     }
 }

@@ -20,6 +20,8 @@ class TransferIntegrationTest {
     @Autowired TransferService service;
     @Autowired AccountRepository accounts;
     @Autowired TransferRepository transfers;
+    @Autowired TransferClaimService claims;
+    @Autowired TransferProcessor processor;
 
     @BeforeEach void reset() {
         transfers.deleteAllInBatch();
@@ -35,9 +37,45 @@ class TransferIntegrationTest {
         assertThat(first.status()).isEqualTo(201);
         assertThat(second.body()).isEqualTo(first.body());
         assertThat(second.replayed()).isTrue();
-        assertThat(service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000001"), new TransferRequest(1L, 2L, 2000L)).status()).isEqualTo(409);
+        assertThat(service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000001"), new TransferRequest(1L, 2L, 2000L)).status()).isEqualTo(422);
         assertThat(balance(1)).isEqualTo(99000);
         assertThat(balance(2)).isEqualTo(101000);
+    }
+    @Test void processingRequestReturns409AndDoesNotMoveMoney() {
+        var key = UUID.randomUUID();
+        var request = new TransferRequest(1L, 2L, 1000L);
+        transfers.saveAndFlush(new TransferRecord(key, request, UUID.randomUUID(), java.time.Instant.now()));
+        var result = service.transfer(key, request);
+        assertThat(result.status()).isEqualTo(409);
+        assertThat(result.body().error()).isEqualTo("request_processing");
+        assertThat(balance(1)).isEqualTo(100000);
+        assertThat(balance(2)).isEqualTo(100000);
+        assertThat(transfers.count()).isEqualTo(1);
+    }
+    @Test void expiredClaimCanBeTakenOverWithoutAllowingTheFormerOwnerToTransfer() {
+        var key = UUID.randomUUID();
+        var oldOwner = UUID.randomUUID();
+        var newOwner = UUID.randomUUID();
+        var request = new TransferRequest(1L, 2L, 1000L);
+        transfers.saveAndFlush(new TransferRecord(key, request, oldOwner,
+                java.time.Instant.now().minusSeconds(31)));
+        assertThat(claims.resolve(key, request, newOwner)).isNull();
+        assertThat(processor.process(key, request, oldOwner).status()).isEqualTo(409);
+        assertThat(processor.process(key, request, newOwner).status()).isEqualTo(201);
+        assertThat(service.transfer(key, request).replayed()).isTrue();
+        assertThat(balance(1)).isEqualTo(99000);
+        assertThat(balance(2)).isEqualTo(101000);
+    }
+    @Test void failedWorkerReleasesOnlyItsOwnProcessingKey() {
+        var key = UUID.randomUUID();
+        var owner = UUID.randomUUID();
+        var request = new TransferRequest(1L, 2L, 1000L);
+        claims.insert(key, request, owner);
+        claims.release(key, UUID.randomUUID());
+        assertThat(transfers.existsById(key.toString())).isTrue();
+        claims.release(key, owner);
+        assertThat(transfers.existsById(key.toString())).isFalse();
+        assertThat(service.transfer(key, request).status()).isEqualTo(201);
     }
     @Test void newKeyCreatesAnotherTransferForTheSamePayload() {
         var request = new TransferRequest(1L, 2L, 1000L);

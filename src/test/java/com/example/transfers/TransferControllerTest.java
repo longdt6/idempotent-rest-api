@@ -58,6 +58,18 @@ class TransferControllerTest {
         assertThat(response.getHeaders().getLocation()).isNull();
     }
 
+    @Test void processingResponseTellsClientToRetryLater() throws Exception {
+        var service = new RecordingService();
+        service.outcome = TransferService.processing(request);
+        var mvc = MockMvcBuilders.standaloneSetup(new TransferController(service)).build();
+        mvc.perform(post("/transfers").header("Idempotency-Key", UUID.randomUUID().toString())
+                .contentType("application/json")
+                .content("{\"fromAccountId\":1,\"toAccountId\":2,\"amountCents\":2500}"))
+                .andExpect(status().isConflict())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header()
+                        .string("Retry-After", "1"));
+    }
+
     @Test void validatesMoneyAndRequiredAccountIds() {
         try (var factory = Validation.buildDefaultValidatorFactory()) {
             var validator = factory.getValidator();
@@ -76,7 +88,7 @@ class TransferControllerTest {
         int calls;
         UUID key;
         Outcome outcome;
-        RecordingService() { super(null, null); }
+        RecordingService() { super(null, null, null, null, 0); }
         @Override public Outcome transfer(UUID key, TransferRequest request) {
             calls++;
             this.key = key;
