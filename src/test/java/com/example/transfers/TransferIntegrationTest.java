@@ -1,6 +1,5 @@
 package com.example.transfers;
 
-import java.util.concurrent.*;
 import java.util.UUID;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -40,69 +39,17 @@ class TransferIntegrationTest {
         assertThat(balance(1)).isEqualTo(99000);
         assertThat(balance(2)).isEqualTo(101000);
     }
-    @Test void concurrentDuplicatesDebitOnce() throws Exception {
-        var start = new CountDownLatch(1);
-        try (var pool = Executors.newFixedThreadPool(8)) {
-            var tasks = new java.util.ArrayList<Future<TransferService.Outcome>>();
-            for (int i = 0; i < 8; i++) tasks.add(pool.submit(() -> {
-                start.await();
-                return service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000002"), new TransferRequest(1L, 2L, 1000L));
-            }));
-            start.countDown();
-            var id = tasks.getFirst().get(20, TimeUnit.SECONDS).body().transferId();
-            for (var task : tasks) assertThat(task.get(20, TimeUnit.SECONDS).body().transferId()).isEqualTo(id);
-        }
-        assertThat(balance(1)).isEqualTo(99000);
-        assertThat(balance(2)).isEqualTo(101000);
-    }
-    @Test void concurrentDistinctKeysCannotOverdraw() throws Exception {
-        try (var pool = Executors.newFixedThreadPool(2)) {
-            var a = pool.submit(() -> service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000003"), new TransferRequest(1L, 2L, 80000L)));
-            var b = pool.submit(() -> service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000004"), new TransferRequest(1L, 2L, 80000L)));
-            assertThat(java.util.List.of(a.get(20, TimeUnit.SECONDS).status(), b.get(20, TimeUnit.SECONDS).status()))
-                    .containsExactlyInAnyOrder(201, 422);
-        }
-        assertThat(balance(1)).isEqualTo(20000);
-        assertThat(balance(2)).isEqualTo(180000);
-    }
-    @Test void oppositeDirectionTransfersCompleteWithoutDeadlock() throws Exception {
-        var start = new CountDownLatch(1);
-        try (var pool = Executors.newFixedThreadPool(2)) {
-            var forward = pool.submit(() -> {
-                start.await();
-                return service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000005"), new TransferRequest(1L, 2L, 50000L));
-            });
-            var reverse = pool.submit(() -> {
-                start.await();
-                return service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000006"), new TransferRequest(2L, 1L, 50000L));
-            });
-            start.countDown();
-            assertThat(forward.get(20, TimeUnit.SECONDS).status()).isEqualTo(201);
-            assertThat(reverse.get(20, TimeUnit.SECONDS).status()).isEqualTo(201);
-        }
-        assertThat(balance(1)).isEqualTo(100000);
-        assertThat(balance(2)).isEqualTo(100000);
-    }
-    @Test void concurrentDifferentPayloadsUnderSameKeyAllowOnlyOneTransfer() throws Exception {
-        var start = new CountDownLatch(1);
-        try (var pool = Executors.newFixedThreadPool(2)) {
-            var first = pool.submit(() -> {
-                start.await();
-                return service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000007"), new TransferRequest(1L, 2L, 1000L));
-            });
-            var second = pool.submit(() -> {
-                start.await();
-                return service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000007"), new TransferRequest(1L, 2L, 2000L));
-            });
-            start.countDown();
-            var a = first.get(20, TimeUnit.SECONDS);
-            var b = second.get(20, TimeUnit.SECONDS);
-            assertThat(java.util.List.of(a.status(), b.status())).containsExactlyInAnyOrder(201, 409);
-            long transferred = a.status() == 201 ? a.body().amountCents() : b.body().amountCents();
-            assertThat(balance(1)).isEqualTo(100000 - transferred);
-            assertThat(balance(2)).isEqualTo(100000 + transferred);
-        }
-        assertThat(transfers.count()).isEqualTo(1);
+    @Test void newKeyCreatesAnotherTransferForTheSamePayload() {
+        var request = new TransferRequest(1L, 2L, 1000L);
+        var first = service.transfer(UUID.randomUUID(), request);
+        var second = service.transfer(UUID.randomUUID(), request);
+        assertThat(first.status()).isEqualTo(201);
+        assertThat(second.status()).isEqualTo(201);
+        assertThat(second.replayed()).isFalse();
+        assertThat(second.body().transferId()).isNotEqualTo(first.body().transferId());
+        assertThat(transfers.count()).isEqualTo(2);
+        assertThat(balance(1)).isEqualTo(98000);
+        assertThat(balance(2)).isEqualTo(102000);
     }
     @Test void failedTransferIsRememberedWithoutChangingBalances() {
         var request = new TransferRequest(1L, 2L, 200000L);

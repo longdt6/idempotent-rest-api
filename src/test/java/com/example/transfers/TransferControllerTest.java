@@ -76,7 +76,7 @@ class TransferControllerTest {
         int calls;
         UUID key;
         Outcome outcome;
-        RecordingService() { super(null, null, null); }
+        RecordingService() { super(null, null); }
         @Override public Outcome transfer(UUID key, TransferRequest request) {
             calls++;
             this.key = key;

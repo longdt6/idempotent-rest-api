@@ -1,73 +1,108 @@
 # Idempotent money transfers
 
-Minimal learning demo based on [Idempotent REST APIs](https://restfulapi.net/idempotent-rest-apis/): Spring Boot 4.1.1, Hibernate with Spring Data JPA, Java 25 LTS, Maven, PostgreSQL 18, and Docker Compose. Run Spring Boot locally on the JVM for quick iteration; Compose runs only PostgreSQL.
+A small, sequential demo of [REST API idempotency](https://restfulapi.net/idempotent-rest-apis/) using Java 25 LTS, Spring Boot 4.1.1, Hibernate / Spring Data JPA, PostgreSQL 18, and Docker Compose.
+
+The lesson: if a client loses the response to a transfer, retrying with the same idempotency key returns the original result without transferring money again. **Send requests one at a time, waiting for each response.** Concurrent-request handling is outside this demo's scope.
 
 ## Run
 
-Install JDK 25 and Maven 3.9+, and start Docker. Confirm `mvn -version` uses JDK 25.
+Install JDK 25 and Maven 3.9+, and start Docker. Check that `mvn -version` uses JDK 25.
 
 ```sh
 docker compose up -d --wait
 mvn spring-boot:run
 ```
 
-DevTools restarts the application when compiled classes change. Rebuild in your IDE or run `mvn compile` after editing Java files.
+Spring Boot runs locally on the JVM; Compose runs PostgreSQL. DevTools restarts the app when compiled classes change. Rebuild in your IDE or run `mvn compile` after editing Java files.
 
-Accounts 1 and 2 start with 100000 and 50000 USD cents ($1,000 and $500). Each amount is an integer number of cents. Fractional amounts and unknown JSON fields are rejected with 400. There is no external payment provider.
+On a fresh database, account 1 has 100000 USD cents ($1,000) and account 2 has 50000 cents ($500).
+
+## Try idempotency
+
+Read the initial balances:
 
 ```sh
 curl -s localhost:8080/accounts
+```
+
+Create a $25 transfer:
+
+```sh
 curl -i localhost:8080/transfers \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000' \
   -d '{"fromAccountId":1,"toAccountId":2,"amountCents":2500}'
 ```
 
-The required `Idempotency-Key` header must be a UUID. Spring converts it to `UUID` and returns 400 for missing or malformed values. Generate a key once per intended transfer and reuse it for retries. UUIDs are stored as canonical strings in the existing column, so no schema migration is needed.
+Run that exact command again after it completes. Both responses return **201**, the same transfer ID, body, and `Location`. The retry has `Idempotency-Replayed: true`. Read `/accounts` again: the balances are **97500** and **52500**, because only one transfer occurred. You can also GET the returned `Location` to read the transfer.
 
-Repeat the POST exactly: both responses have status 201, the same transfer ID, body, and Location. The retry has `Idempotency-Replayed: true`. Account 1 is debited only once. Follow the returned Location with GET to read the transfer.
+Now reuse the key with a different amount:
 
-Reuse `550e8400-e29b-41d4-a716-446655440000` with `amountCents` changed to 3000: the server returns 409 and balances stay unchanged. A new key represents a new transfer, even if the payload is identical.
+```sh
+curl -i localhost:8080/transfers \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000' \
+  -d '{"fromAccountId":1,"toAccountId":2,"amountCents":3000}'
+```
+
+This returns **409 Conflict**, with no balance change.
+
+| Request | Result |
+| --- | --- |
+| New key | Process the transfer and save its result |
+| Same key, same payload | Replay the saved result; balances stay unchanged |
+| Same key, different payload | Return 409; balances stay unchanged |
+| Different key, same payload | Create another transfer |
+
+Generate one UUID key per intended transfer and reuse it for retries. Spring's required `@RequestHeader("Idempotency-Key") UUID key` binding returns 400 for missing or malformed values. Keys are saved as canonical strings in the database.
 
 ## How it works
 
-1. Acquire a JPA pessimistic write lock on a shared `transfer_mutex` row before looking up the idempotency key. This prevents two transactions from simultaneously creating the same missing key, including requests handled by different application instances.
-2. Compare the account IDs and amount against the saved entity. A changed payload returns 409; a completed request replays its saved result.
-3. Lock the account entities in ascending ID order, then debit and credit them. Hibernate dirty checking saves balance changes automatically.
-4. Save the transfer result through a Spring Data JPA repository. Both balances and the result commit in one transaction. A crash before commit rolls everything back; a lost response after commit can be retried safely.
+1. Look up the idempotency key through a JPA repository.
+2. If it exists, compare the account IDs and amount. Replay the saved result or reject a changed payload.
+3. Otherwise, load the accounts, debit the source, credit the destination, and save the result.
 
-For this minimal demo, the shared lock deliberately serializes **all transfers**, including different keys. This trades throughput for a simple implementation without database-specific runtime queries. Repositories use derived queries and JPA locks; Java code contains no JDBC, native SQL, or result-set mapping. Hibernate chooses the database dialect. Changing databases still requires the appropriate driver and compatible Flyway migrations; the existing UUID and timestamp migration targets PostgreSQL.
+A single `@Transactional` method commits the balance changes and saved result together. Hibernate dirty checking persists the account changes. Flyway owns the schema; Hibernate validates it. There are no custom locks, native runtime queries, or JDBC result-set mappings.
 
-Flyway creates the schema; Hibernate validates it at startup. Open Session in View is disabled, and service methods return DTOs rather than exposing managed entities.
-
-Validation errors (400) do not consume the key. Business failures are saved and replayed: unknown account (404), same source/destination (422), insufficient funds (422), or destination balance limit (422). Balances and amounts are capped at 1,000,000,000,000 cents. Database/system failures roll back the request and can be retried with the same key.
-
-GET reads state without changing it. POST achieves safe retries through the key contract; this does not make POST intrinsically idempotent. Transfers are immutable, so this demo does not expose PUT, PATCH, or DELETE for payments.
+Amounts are positive integer USD cents. Fractional amounts and unknown JSON fields return 400 without consuming the key. Unknown accounts return 404; same-account transfers, insufficient funds, and the balance limit return 422. Business failures are saved and replayed for the same key, even if balances later change. Amounts and balances are capped at 1,000,000,000,000 cents.
 
 ## Tests
 
-Run validation and controller tests without PostgreSQL:
+Run controller binding and validation tests without PostgreSQL:
 
 ```sh
 mvn test
 ```
 
-The integration tests use real PostgreSQL and cover HTTP response replay, strict JSON input, payload mismatch, concurrent duplicate requests, concurrent different keys, opposite-direction transfers, conflicting concurrent payloads, and remembered business failures. They reset demo data, so run them against a disposable database:
+Run the sequential integration tests against a disposable PostgreSQL database:
 
 ```sh
 docker compose up -d --wait
 RUN_DB_TESTS=true mvn test
 ```
 
-Without `RUN_DB_TESTS=true`, only database tests are skipped; validation and controller tests still run. `mvn package` builds the executable JVM jar; run it with `java -jar target/idempotent-transfers-0.0.1-SNAPSHOT.jar`.
+Integration tests reset demo data and cover replay, changed payloads, new keys, saved business failures, HTTP response replay, and strict JSON input. They are skipped unless `RUN_DB_TESTS=true`.
 
 ## Configuration and reset
 
-Override `DATABASE_URL`, `DATABASE_USER`, `DATABASE_PASSWORD`, or `PORT` as needed. Compose binds PostgreSQL to localhost. Stop it with `docker compose down`; balances and keys persist in the volume. To erase all demo data and reseed on the next start:
+Override `DATABASE_URL`, `DATABASE_USER`, `DATABASE_PASSWORD`, or `PORT` as needed. PostgreSQL binds to localhost. `docker compose down` keeps the data volume; balances and keys survive restarts.
+
+To erase demo data and reseed on the next app start:
 
 ```sh
 docker compose down -v
 docker compose up -d --wait
 ```
 
-This is a single-currency learning application with no authentication. Keys are global and retained indefinitely; a real multi-user service needs ownership checks, a tenant-scoped key policy, and an explicit retention contract. All money movement here occurs inside one PostgreSQL database.
+Build the JVM jar with `mvn package`, then run `java -jar target/idempotent-transfers-0.0.1-SNAPSHOT.jar`.
+
+For databases created by the earlier demo, migration V3 removes the old mutex table. V2 stays unchanged to preserve Flyway migration history.
+
+## Out of scope
+
+- **Concurrency and race conditions:** the lookup-then-save flow assumes sequential requests. Simultaneous requests can race, fail, or overwrite balances. A unique key constraint alone does not make this flow safe under concurrency. Account locks, duplicate-insert recovery, transaction retries, and multi-instance coordination belong in a separate lesson.
+- **Production payments:** external payment providers, double-entry accounting, reconciliation, currencies, and distributed side effects are not implemented. Money movement happens inside one database.
+- **Authentication and ownership:** accounts have no access checks; idempotency keys are global rather than scoped to users.
+- **Key lifecycle:** results are retained indefinitely; expiration, cleanup, and retention guarantees are not implemented.
+
+GET reads state without changing it. POST remains a non-idempotent HTTP method; this endpoint makes sequential retries safe through its idempotency-key contract. Transfers are immutable, so there are no PUT, PATCH, or DELETE endpoints.

@@ -4,7 +4,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 @Service
@@ -12,12 +11,10 @@ public class TransferService {
     private static final long MAX_BALANCE_CENTS = 1000000000000L;
     private final AccountRepository accounts;
     private final TransferRepository transfers;
-    private final TransferMutexRepository mutex;
 
-    public TransferService(AccountRepository accounts, TransferRepository transfers, TransferMutexRepository mutex) {
+    public TransferService(AccountRepository accounts, TransferRepository transfers) {
         this.accounts = accounts;
         this.transfers = transfers;
-        this.mutex = mutex;
     }
 
     public record Outcome(int status, TransferResult body, boolean replayed) {}
@@ -34,11 +31,9 @@ public class TransferService {
         return transfers.findByTransferId(id).map(TransferRecord::toResult);
     }
 
-    @Transactional(isolation = Isolation.READ_COMMITTED)
+    @Transactional
     public Outcome transfer(UUID key, TransferRequest request) {
-        // Lock an existing row before looking up a key: a missing request row cannot be locked.
-        // This intentionally serializes all transfers for the minimal learning demo.
-        mutex.findById(1L).orElseThrow(() -> new IllegalStateException("Transfer mutex is missing"));
+        // This learning demo assumes requests execute sequentially.
         var existing = transfers.findById(key.toString());
         if (existing.isPresent()) {
             var stored = existing.get();
@@ -51,16 +46,13 @@ public class TransferService {
         if (request.fromAccountId().equals(request.toAccountId())) {
             return finish(key, request, 422, null, "same_account");
         }
-        // Use a consistent lock order, including opposite-direction transfers.
-        long firstId = Math.min(request.fromAccountId(), request.toAccountId());
-        long secondId = Math.max(request.fromAccountId(), request.toAccountId());
-        var first = accounts.findOneById(firstId);
-        var second = accounts.findOneById(secondId);
-        if (first.isEmpty() || second.isEmpty()) {
+        var sourceAccount = accounts.findById(request.fromAccountId());
+        var destinationAccount = accounts.findById(request.toAccountId());
+        if (sourceAccount.isEmpty() || destinationAccount.isEmpty()) {
             return finish(key, request, 404, null, "account_not_found");
         }
-        Account source = request.fromAccountId() == firstId ? first.get() : second.get();
-        Account destination = request.toAccountId() == firstId ? first.get() : second.get();
+        var source = sourceAccount.get();
+        var destination = destinationAccount.get();
         if (source.getBalanceCents() < request.amountCents()) {
             return finish(key, request, 422, null, "insufficient_funds");
         }
