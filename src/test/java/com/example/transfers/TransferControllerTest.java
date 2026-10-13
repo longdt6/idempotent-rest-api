@@ -3,25 +3,46 @@ package com.example.transfers;
 import java.util.UUID;
 import jakarta.validation.Validation;
 import org.junit.jupiter.api.Test;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class TransferControllerTest {
     private final TransferRequest request = new TransferRequest(1L, 2L, 2500L);
 
-    @Test void rejectsMissingAndInvalidKeysBeforeCallingService() {
+    @Test void springRejectsMissingAndInvalidKeysBeforeCallingService() throws Exception {
         var service = new RecordingService();
-        var controller = new TransferController(service);
-        for (String key : new String[]{null, "", " ", "key with spaces", "x".repeat(129)}) {
-            assertThat(controller.transfer(key, request).getStatusCode().value()).isEqualTo(400);
+        var mvc = MockMvcBuilders.standaloneSetup(new TransferController(service)).build();
+        String body = "{\"fromAccountId\":1,\"toAccountId\":2,\"amountCents\":2500}";
+        mvc.perform(post("/transfers").contentType("application/json").content(body))
+                .andExpect(status().isBadRequest());
+        for (String key : new String[]{"", " ", "payment-001", "not-a-uuid", "x".repeat(129)}) {
+            mvc.perform(post("/transfers").header("Idempotency-Key", key)
+                    .contentType("application/json").content(body)).andExpect(status().isBadRequest());
         }
         assertThat(service.calls).isZero();
+    }
+
+    @Test void springConvertsHeaderToUuid() throws Exception {
+        var service = new RecordingService();
+        var id = UUID.randomUUID();
+        service.outcome = new TransferService.Outcome(201,
+                new TransferResult(UUID.randomUUID(), 1L, 2L, 2500L, null), false);
+        var mvc = MockMvcBuilders.standaloneSetup(new TransferController(service)).build();
+        mvc.perform(post("/transfers").header("Idempotency-Key", id.toString())
+                .contentType("application/json")
+                .content("{\"fromAccountId\":1,\"toAccountId\":2,\"amountCents\":2500}"))
+                .andExpect(status().isCreated());
+        assertThat(service.key).isEqualTo(id);
+        assertThat(service.calls).isEqualTo(1);
     }
 
     @Test void replayPreservesStatusBodyAndLocation() {
         var service = new RecordingService();
         var body = new TransferResult(UUID.randomUUID(), 1L, 2L, 2500L, null);
         service.outcome = new TransferService.Outcome(201, body, true);
-        var response = new TransferController(service).transfer("payment-001", request);
+        var response = new TransferController(service).transfer(UUID.randomUUID(), request);
         assertThat(response.getStatusCode().value()).isEqualTo(201);
         assertThat(response.getBody()).isEqualTo(body);
         assertThat(response.getHeaders().getLocation().toString()).isEqualTo("/transfers/" + body.transferId());
@@ -32,7 +53,7 @@ class TransferControllerTest {
         var service = new RecordingService();
         service.outcome = new TransferService.Outcome(422,
                 new TransferResult(null, 1L, 2L, 2500L, "insufficient_funds"), true);
-        var response = new TransferController(service).transfer("payment-001", request);
+        var response = new TransferController(service).transfer(UUID.randomUUID(), request);
         assertThat(response.getStatusCode().value()).isEqualTo(422);
         assertThat(response.getHeaders().getLocation()).isNull();
     }
@@ -53,10 +74,12 @@ class TransferControllerTest {
 
     private static class RecordingService extends TransferService {
         int calls;
+        UUID key;
         Outcome outcome;
         RecordingService() { super(null, null, null); }
-        @Override public Outcome transfer(String key, TransferRequest request) {
+        @Override public Outcome transfer(UUID key, TransferRequest request) {
             calls++;
+            this.key = key;
             return outcome;
         }
     }

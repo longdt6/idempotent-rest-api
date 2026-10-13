@@ -19,13 +19,15 @@ Accounts 1 and 2 start with 100000 and 50000 USD cents ($1,000 and $500). Each a
 curl -s localhost:8080/accounts
 curl -i localhost:8080/transfers \
   -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: payment-001' \
+  -H 'Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000' \
   -d '{"fromAccountId":1,"toAccountId":2,"amountCents":2500}'
 ```
 
+The required `Idempotency-Key` header must be a UUID. Spring converts it to `UUID` and returns 400 for missing or malformed values. Generate a key once per intended transfer and reuse it for retries. UUIDs are stored as canonical strings in the existing column, so no schema migration is needed.
+
 Repeat the POST exactly: both responses have status 201, the same transfer ID, body, and Location. The retry has `Idempotency-Replayed: true`. Account 1 is debited only once. Follow the returned Location with GET to read the transfer.
 
-Reuse `payment-001` with `amountCents` changed to 3000: the server returns 409 and balances stay unchanged. A new key represents a new transfer, even if the payload is identical.
+Reuse `550e8400-e29b-41d4-a716-446655440000` with `amountCents` changed to 3000: the server returns 409 and balances stay unchanged. A new key represents a new transfer, even if the payload is identical.
 
 ## How it works
 

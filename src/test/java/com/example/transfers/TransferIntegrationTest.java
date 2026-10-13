@@ -1,6 +1,7 @@
 package com.example.transfers;
 
 import java.util.concurrent.*;
+import java.util.UUID;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -30,12 +31,12 @@ class TransferIntegrationTest {
     }
     @Test void retriesReplayAndRejectDifferentPayload() {
         var request = new TransferRequest(1L, 2L, 1000L);
-        var first = service.transfer("retry", request);
-        var second = service.transfer("retry", request);
+        var first = service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000001"), request);
+        var second = service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000001"), request);
         assertThat(first.status()).isEqualTo(201);
         assertThat(second.body()).isEqualTo(first.body());
         assertThat(second.replayed()).isTrue();
-        assertThat(service.transfer("retry", new TransferRequest(1L, 2L, 2000L)).status()).isEqualTo(409);
+        assertThat(service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000001"), new TransferRequest(1L, 2L, 2000L)).status()).isEqualTo(409);
         assertThat(balance(1)).isEqualTo(99000);
         assertThat(balance(2)).isEqualTo(101000);
     }
@@ -45,7 +46,7 @@ class TransferIntegrationTest {
             var tasks = new java.util.ArrayList<Future<TransferService.Outcome>>();
             for (int i = 0; i < 8; i++) tasks.add(pool.submit(() -> {
                 start.await();
-                return service.transfer("concurrent", new TransferRequest(1L, 2L, 1000L));
+                return service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000002"), new TransferRequest(1L, 2L, 1000L));
             }));
             start.countDown();
             var id = tasks.getFirst().get(20, TimeUnit.SECONDS).body().transferId();
@@ -56,8 +57,8 @@ class TransferIntegrationTest {
     }
     @Test void concurrentDistinctKeysCannotOverdraw() throws Exception {
         try (var pool = Executors.newFixedThreadPool(2)) {
-            var a = pool.submit(() -> service.transfer("a", new TransferRequest(1L, 2L, 80000L)));
-            var b = pool.submit(() -> service.transfer("b", new TransferRequest(1L, 2L, 80000L)));
+            var a = pool.submit(() -> service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000003"), new TransferRequest(1L, 2L, 80000L)));
+            var b = pool.submit(() -> service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000004"), new TransferRequest(1L, 2L, 80000L)));
             assertThat(java.util.List.of(a.get(20, TimeUnit.SECONDS).status(), b.get(20, TimeUnit.SECONDS).status()))
                     .containsExactlyInAnyOrder(201, 422);
         }
@@ -69,11 +70,11 @@ class TransferIntegrationTest {
         try (var pool = Executors.newFixedThreadPool(2)) {
             var forward = pool.submit(() -> {
                 start.await();
-                return service.transfer("forward", new TransferRequest(1L, 2L, 50000L));
+                return service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000005"), new TransferRequest(1L, 2L, 50000L));
             });
             var reverse = pool.submit(() -> {
                 start.await();
-                return service.transfer("reverse", new TransferRequest(2L, 1L, 50000L));
+                return service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000006"), new TransferRequest(2L, 1L, 50000L));
             });
             start.countDown();
             assertThat(forward.get(20, TimeUnit.SECONDS).status()).isEqualTo(201);
@@ -87,11 +88,11 @@ class TransferIntegrationTest {
         try (var pool = Executors.newFixedThreadPool(2)) {
             var first = pool.submit(() -> {
                 start.await();
-                return service.transfer("shared-key", new TransferRequest(1L, 2L, 1000L));
+                return service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000007"), new TransferRequest(1L, 2L, 1000L));
             });
             var second = pool.submit(() -> {
                 start.await();
-                return service.transfer("shared-key", new TransferRequest(1L, 2L, 2000L));
+                return service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000007"), new TransferRequest(1L, 2L, 2000L));
             });
             start.countDown();
             var a = first.get(20, TimeUnit.SECONDS);
@@ -105,9 +106,9 @@ class TransferIntegrationTest {
     }
     @Test void failedTransferIsRememberedWithoutChangingBalances() {
         var request = new TransferRequest(1L, 2L, 200000L);
-        var first = service.transfer("failed", request);
+        var first = service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000008"), request);
         accounts.save(new Account(1L, 300000));
-        var replay = service.transfer("failed", request);
+        var replay = service.transfer(UUID.fromString("00000000-0000-4000-8000-000000000008"), request);
         assertThat(first.status()).isEqualTo(422);
         assertThat(replay.body()).isEqualTo(first.body());
         assertThat(replay.replayed()).isTrue();
@@ -120,7 +121,7 @@ class TransferIntegrationTest {
                     "{\"fromAccountId\":1,\"toAccountId\":2,\"amountCents\":1.9}",
                     "{\"fromAccountId\":1,\"toAccountId\":2,\"amountCents\":100,\"currency\":\"EUR\"}"}) {
                 var response = client.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/transfers"))
-                        .header("Content-Type", "application/json").header("Idempotency-Key", "invalid-json")
+                        .header("Content-Type", "application/json").header("Idempotency-Key", "00000000-0000-4000-8000-000000000009")
                         .POST(HttpRequest.BodyPublishers.ofString(body)).build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(response.statusCode()).isEqualTo(400);
             }
@@ -132,7 +133,7 @@ class TransferIntegrationTest {
     @Test void httpRetryReplaysOriginalResponseAndLocation() throws Exception {
         try (var client = HttpClient.newHttpClient()) {
             var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/transfers"))
-                    .header("Content-Type", "application/json").header("Idempotency-Key", "http-retry")
+                    .header("Content-Type", "application/json").header("Idempotency-Key", "00000000-0000-4000-8000-000000000010")
                     .POST(HttpRequest.BodyPublishers.ofString(
                             "{\"fromAccountId\":1,\"toAccountId\":2,\"amountCents\":2500}"))
                     .build();

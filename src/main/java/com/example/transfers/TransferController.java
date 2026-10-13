@@ -14,19 +14,14 @@ public class TransferController {
         this.service = service;
     }
 
-    public record Error(String error) {}
-
     @GetMapping("/accounts")
     public List<TransferService.AccountBalance> accounts() {
         return service.listAccounts();
     }
 
     @PostMapping("/transfers")
-    public ResponseEntity<?> transfer(@RequestHeader(value = "Idempotency-Key", required = false) String key,
+    public ResponseEntity<TransferResult> transfer(@RequestHeader("Idempotency-Key") UUID key,
                                       @Valid @RequestBody TransferRequest request) {
-        if (key == null || !key.matches("[A-Za-z0-9._:-]{1,128}")) {
-            return ResponseEntity.badRequest().body(new Error("invalid_or_missing_idempotency_key"));
-        }
         var outcome = service.transfer(key, request);
         var response = ResponseEntity.status(outcome.status())
                 .header("Idempotency-Replayed", Boolean.toString(outcome.replayed()));

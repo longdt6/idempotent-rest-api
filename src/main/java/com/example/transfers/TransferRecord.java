@@ -37,8 +37,8 @@ public class TransferRecord {
 
     protected TransferRecord() {}
 
-    public TransferRecord(String key, TransferRequest request, int status, UUID transferId, String error) {
-        this.idempotencyKey = key;
+    public TransferRecord(UUID key, TransferRequest request, int status, UUID transferId, String error) {
+        this.idempotencyKey = key.toString();
         this.fromAccountId = request.fromAccountId();
         this.toAccountId = request.toAccountId();
         this.amountCents = request.amountCents();

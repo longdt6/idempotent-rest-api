@@ -35,11 +35,11 @@ public class TransferService {
     }
 
     @Transactional(isolation = Isolation.READ_COMMITTED)
-    public Outcome transfer(String key, TransferRequest request) {
+    public Outcome transfer(UUID key, TransferRequest request) {
         // Lock an existing row before looking up a key: a missing request row cannot be locked.
         // This intentionally serializes all transfers for the minimal learning demo.
         mutex.findById(1L).orElseThrow(() -> new IllegalStateException("Transfer mutex is missing"));
-        var existing = transfers.findById(key);
+        var existing = transfers.findById(key.toString());
         if (existing.isPresent()) {
             var stored = existing.get();
             if (!stored.matches(request)) {
@@ -73,7 +73,7 @@ public class TransferService {
         return finish(key, request, 201, UUID.randomUUID(), null);
     }
 
-    private Outcome finish(String key, TransferRequest request, int status, UUID id, String error) {
+    private Outcome finish(UUID key, TransferRequest request, int status, UUID id, String error) {
         var stored = transfers.save(new TransferRecord(key, request, status, id, error));
         return new Outcome(status, stored.toResult(), false);
     }
